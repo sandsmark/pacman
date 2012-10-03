@@ -77,6 +77,8 @@ CHECKFUNC=0
 PKGFUNC=0
 PKGVERFUNC=0
 SPLITPKG=0
+SPLITDEBUG=0
+SKIPDEBUGPACKAGE=0
 PKGLIST=()
 SIGNPKG=''
 
@@ -1464,21 +1466,54 @@ tidy_install() {
 			-exec @INODECMD@ '{}' + 2>/dev/null)
 	fi
 
+  if [[ $(check_option splitdebug) = "y" ]] || (( SPLITDEBUG )); then
+      local splitdebug=1
+      local dbgdir="$pkgdir-debug/usr/lib/debug"
+      backup_package_variables "debug"
+  fi
+
 	if check_option "strip" "y"; then
 		msg2 "$(gettext "Stripping unneeded symbols from binaries and libraries...")"
 		# make sure library stripping variables are defined to prevent excess stripping
 		[[ -z ${STRIP_SHARED+x} ]] && STRIP_SHARED="-S"
 		[[ -z ${STRIP_STATIC+x} ]] && STRIP_STATIC="-S"
-		local binary
+		local binary hardlink strip_opt
 		find . -type f -perm -u+w -print0 2>/dev/null | while read -d '' binary ; do
 			case "$(file -bi "$binary")" in
 				*application/x-sharedlib*)  # Libraries (.so)
-					strip $STRIP_SHARED "$binary";;
+					strip_opt=$STRIP_SHARED;;
 				*application/x-archive*)    # Libraries (.a)
-					strip $STRIP_STATIC "$binary";;
+					strip_opt=$STRIP_STATIC;;
 				*application/x-executable*) # Binaries
-					strip $STRIP_BINARIES "$binary";;
+					strip_opt=$STRIP_BINARIES;;
+				*) continue ;;
 			esac
+			# Strip symbols
+			if (( ! splitdebug )); then
+				strip $strip_opts "$binary"
+			else
+				# Create directory for the symbol file
+				mkdir -p "${dbgdir}/${binary%/*}"
+				if objdump --section-headers "$binary" | grep "\.gnu_debuglink" &>/dev/null; then
+					# An already stripped binary is a hard link
+					find ${STRIP_DIRS[@]} -samefile "$binary" -print0 2>/dev/null |
+					while read -r hardlink ; do
+						# Is the symbol file for the hardlink in the right dir ?
+						if [[ -e "${dbgdir}/${hardlink#/}.debug" ]]; then
+							if [[ "${hardlink%/*}" != "${binary%/*}" ]]; then
+								ln "${dbgdir}/${hardlink#/}.debug" "${dbgdir}/${binary%/*}"
+								break
+							fi
+						fi
+					done
+				else
+					# Strip the file
+					objcopy --only-keep-debug "$binary" "${dbgdir}/${binary#/}.debug"
+					strip $strip_opts "$binary"
+					objcopy --add-gnu-debuglink="${dbgdir}/${binary#/}.debug" "$binary"
+					chmod 644 "${dbgdir}/${binary#/}.debug"
+				fi
+			fi
 		done
 	fi
 
@@ -1712,6 +1747,12 @@ check_package() {
 }
 
 create_package() {
+	if (( SKIPDEBUGPACKAGE )); then
+		warning "$(gettext "No .debug files for debug package found, skipping...")"
+		SKIPDEBUGPACKAGE=0
+		return
+	fi
+
 	if [[ ! -d $pkgdir ]]; then
 		error "$(gettext "Missing %s directory.")" "pkg/"
 		plain "$(gettext "Aborting...")"
@@ -1823,6 +1864,33 @@ create_signature() {
 	else
 		warning "$(gettext "Failed to sign package file.")"
 	fi
+}
+
+add_split_debug_packages() {
+    if (( ${#pkgname[@]} == 1 )); then
+        eval "package_${pkgname}() { package; }"
+    fi
+
+    local pkg pkgname_with_debug
+    for pkg in "${pkgname[@]}"; do
+        pkgname_with_debug=("${pkgname_with_debug[@]}" "${pkg}" "${pkg/%/-debug}")
+        eval "package_${pkg}-debug() { package_debug; }"
+    done
+    pkgname=("${pkgname_with_debug[@]}")
+}
+
+package_debug() {
+    if [[ ! $(find "$pkgdir/" -name "*.debug") ]]; then
+        SKIPDEBUGPACKAGE=1
+        return
+    fi
+
+    restore_package_variables "debug"
+    pkgdesc="$pkgdesc (debugging symbols)"
+    depends=("${pkgname%-debug}=$pkgver-$pkgrel")
+    groups=('debug' "${groups[@]/%/-debug}")
+    options=(!strip !splitdebug !zipman !purge !emptydirs !upx)
+    unset optdepends provides conflicts replaces backup install changelog
 }
 
 create_srcpackage() {
@@ -2234,16 +2302,18 @@ check_build_status() {
 
 backup_package_variables() {
 	local var
+	local suffix=$1
 	for var in ${splitpkg_overrides[@]}; do
-		local indirect="${var}_backup"
+		local indirect="${var}_backup${suffix}"
 		eval "${indirect}=(\"\${$var[@]}\")"
 	done
 }
 
 restore_package_variables() {
 	local var
+	local suffix=$1
 	for var in ${splitpkg_overrides[@]}; do
-		local indirect="${var}_backup"
+		local indirect="${var}_backup${suffix}"
 		if [[ -n ${!indirect} ]]; then
 			eval "${var}=(\"\${$indirect[@]}\")"
 		else
@@ -2315,6 +2385,7 @@ usage() {
 	printf -- "$(gettext "  -s, --syncdeps   Install missing dependencies with %s")\n" "pacman"
 	printf -- "$(gettext "  -S, --source     Generate a source-only tarball without downloaded sources")\n"
 	printf -- "$(gettext "  --allsource      Generate a source-only tarball including downloaded sources")\n"
+	printf -- "$(gettext "  -t, --splitdebug   Split debugging symbols into	separate package")"
 	printf -- "$(gettext "  --asroot         Allow %s to run as root user")\n" "makepkg"
 	printf -- "$(gettext "  --check          Run the %s function in the %s")\n" "check()" "$BUILDSCRIPT"
 	printf -- "$(gettext "  --config <file>  Use an alternate config file (instead of '%s')")\n" "$confdir/makepkg.conf"
@@ -2359,12 +2430,12 @@ fi
 ARGLIST=("$@")
 
 # Parse Command Line Options.
-OPT_SHORT="AcdefFghiLmop:rRsSV"
+OPT_SHORT="AcdefFghiLmop:rRsStV"
 OPT_LONG=('allsource' 'asroot' 'check' 'clean' 'config:' 'force' 'geninteg'
           'help' 'holdver' 'ignorearch' 'install' 'key:' 'log' 'nobuild' 'nocolor'
           'nocheck' 'nodeps' 'noextract' 'nosign' 'pkg:' 'repackage' 'rmdeps'
           'skipchecksums' 'skipinteg' 'skippgpcheck' 'skippgpcheck' 'sign'
-          'source' 'syncdeps' 'version')
+          'splitdebug' 'source' 'syncdeps' 'version')
 
 # Pacman Options
 OPT_LONG+=('asdeps' 'noconfirm' 'noprogressbar')
@@ -2412,6 +2483,7 @@ while true; do
 		--sign)           SIGNPKG='y' ;;
 		-s|--syncdeps)    DEP_BIN=1 ;;
 		-S|--source)      SOURCEONLY=1 ;;
+		-t|--splitdebug)  SPLITDEBUG=1 ;;
 
 		-h|--help)        usage; exit 0 ;; # E_OK
 		-V|--version)     version; exit 0 ;; # E_OK
@@ -2610,6 +2682,10 @@ check_sanity || exit 1
 
 # check we have the software required to process the PKGBUILD
 check_software || exit 1
+
+if [[ $(check_option splitdebug) = "y" ]] || (( SPLITDEBUG )); then
+	add_split_debug_packages
+fi
 
 if (( ${#pkgname[@]} > 1 )); then
 	SPLITPKG=1
